@@ -1,0 +1,7 @@
+interface:
+  display_name: "闲鱼安全助手"
+  short_description: "安全登录、搜索、查看消息订单，并在确认后管理闲鱼商品"
+  default_prompt: "Use $xianyu-safe for Xianyu login, filtered search, item/message/order lookup, or an explicitly approved one-off write action."
+
+policy:
+  allow_implicit_invocation: true

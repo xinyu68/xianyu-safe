@@ -1,0 +1,10 @@
+**/.runtime/
+**/.venv/
+**/__pycache__/
+**/*.egg-info/
+.pytest_cache/
+.test-artifacts/
+*.py[cod]
+*.json.tmp
+xianyu-storage-state.json
+xianyu-idempotency.json
