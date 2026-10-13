@@ -109,6 +109,32 @@ class FavoritesTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.writes()), 1)
         self.assertEqual(self.page.wait_for_timeout.await_count, 2)
 
+    async def test_validation_before_submission_preserves_not_submitted_and_no_receipt(self):
+        self.request.side_effect = cli._verification_error(["FAIL_SYS_USER_VALIDATE"])
+        with self.assertRaises(cli.XianyuError) as error:
+            await cli._run_favorite(self.args)
+        self.assertEqual(error.exception.code, "human_verification_required")
+        self.assertFalse(error.exception.details["submitted"])
+        self.assertEqual(error.exception.details["outcome"], "not_submitted")
+        self.assertFalse(list(self.profile.iterdir()))
+        self.assertEqual(self.writes(), [])
+
+    async def test_validation_after_submission_saves_unknown_before_handoff_and_no_replay(self):
+        self.request.side_effect = [detail(False), cli._verification_error(["FAIL_SYS_USER_VALIDATE"])]
+        async def check_saved(*args):
+            record = cli._favorite_records(self.profile)[self.args.idempotency_key]
+            self.assertEqual(record["result"]["state"], "unknown")
+        with patch.object(cli, "_close_context", AsyncMock(side_effect=check_saved)):
+            with self.assertRaises(cli.XianyuError) as error:
+                await cli._run_favorite(self.args)
+        self.assertTrue(error.exception.details["submitted"])
+        self.assertEqual(error.exception.details["outcome"], "unknown")
+        count = self.request.call_count
+        result = await cli._run_favorite(self.args)
+        self.assertEqual(result["state"], "unknown")
+        self.assertTrue(result["replayed"])
+        self.assertEqual(self.request.call_count, count)
+
     async def test_unknown_state_and_wrong_item_stop_before_write(self):
         for data in (detail(None), detail(1), detail("true"), detail(False, "987654321012"),
                      {"itemDO": {"itemId": ITEM_ID, "title": "测试"}, "buyerDO": {"favored": True}}):

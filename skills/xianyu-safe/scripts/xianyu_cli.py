@@ -12,7 +12,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 
 HOME_URL = "https://www.goofish.com/"
@@ -22,7 +22,9 @@ PUBLISH_URL = "https://www.goofish.com/publish"
 PERSONAL_URL = "https://www.goofish.com/personal"
 ORDERS_URL = "https://www.goofish.com/bought"
 DEFAULT_TIMEOUT_MS = 45_000
-SCHEMA_VERSION = "0.3.0"
+SCHEMA_VERSION = "0.3.1"
+VERIFICATION_WAIT_SECONDS = 180
+VERIFICATION_CODES = {"FAIL_SYS_USER_VALIDATE", "RGV587_ERROR"}
 FAVORITES_URL = "https://www.goofish.com/collection"
 FAVORITES_LIST_API = "mtop.taobao.idle.web.favor.item.list"
 FAVORITE_APIS = {"favorite": "mtop.taobao.idle.collect.item", "unfavorite": "com.taobao.idle.unfavor.item"}
@@ -240,6 +242,7 @@ async def _open_context(
     headless: bool,
     *,
     background: bool = False,
+    verification_timeout: int | None = None,
 ):
     try:
         from playwright.async_api import async_playwright
@@ -270,7 +273,12 @@ async def _open_context(
             details={"profile_dir": str(profile_dir)},
         ) from exc
     context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+    context._xianyu_verification = _VerificationMonitor(
+        context, headless=headless,
+        timeout=VERIFICATION_WAIT_SECONDS if verification_timeout is None else verification_timeout,
+    )
     await _restore_storage_state(context, profile_dir)
+    context._xianyu_verification.profile_dir = profile_dir
     return manager, context
 
 
@@ -288,12 +296,17 @@ async def _navigate(page, url: str) -> None:
 
 
 async def _mtop_request(page, api: str, data: dict[str, Any], *, require_login: bool = False) -> dict[str, Any]:
+    monitor = _page_verification(page)
     try:
+        if monitor is not None:
+            monitor.check(page)
         await page.wait_for_function(
             "() => Boolean(window.lib && window.lib.mtop && window.lib.mtop.request)",
             timeout=10_000,
         )
-        result = await page.evaluate(
+        if monitor is not None:
+            monitor.check(page)
+        operation = page.evaluate(
             """
             async payload => {
               const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -304,6 +317,7 @@ async def _mtop_request(page, api: str, data: dict[str, Any], *, require_login: 
                   type: 'POST',
                   v: '1.0',
                   dataType: 'json',
+                  timeout: 20000,
                   needLogin: false,
                   needLoginPC: payload.requireLogin === true,
                   sessionOption: 'AutoLoginOnly',
@@ -321,15 +335,31 @@ async def _mtop_request(page, api: str, data: dict[str, Any], *, require_login: 
             """,
             {"api": api, "data": data, "requireLogin": require_login},
         )
+        result = await monitor.request(page, operation) if monitor is not None else await operation
+    except XianyuError:
+        raise
     except Exception as exc:
+        if monitor is not None:
+            monitor.check(page)
         raise XianyuError("mtop_unavailable", "闲鱼页面接口尚未初始化") from exc
 
+    raw = result.get("response") if isinstance(result, dict) and result.get("ok") else result
+    validation_codes = _verification_codes(raw)
+    if validation_codes:
+        if monitor is not None:
+            challenge_data = raw.get("data")
+            challenge = challenge_data.get("url") if isinstance(challenge_data, dict) else None
+            monitor.note(page, validation_codes, challenge, api)
+            monitor.check(page)
+        raise _verification_error(validation_codes)
     if not result or not result.get("ok"):
         ret = " | ".join(str(value) for value in (result or {}).get("ret") or [])
         message = ret or str((result or {}).get("message") or "未知错误")
         code = message.split("::", 1)[0]
         if "SESSION" in code or "TOKEN" in code:
             raise XianyuError("not_logged_in", "闲鱼登录态已失效，请重新运行 login")
+        if code == "TIMEOUT":
+            raise XianyuError("mtop_timeout", "闲鱼页面接口超时；当前没有捕获到人工验证响应，不能据此判定接口宕机或需要验证")
         raise XianyuError("mtop_request_failed", f"闲鱼页面接口请求失败：{message}")
 
     response = result.get("response") or {}
@@ -488,8 +518,7 @@ async def _run_login(args: argparse.Namespace) -> dict[str, Any]:
             f"在 {args.timeout} 秒内未检测到登录成功，请重新运行 login",
         )
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _run_status(args: argparse.Namespace) -> dict[str, Any]:
@@ -508,8 +537,7 @@ async def _run_status(args: argparse.Namespace) -> dict[str, Any]:
             await _save_storage_state(context, profile_dir)
         return {"success": True, **snapshot}
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _extract_items(page) -> list[dict[str, Any]]:
@@ -662,8 +690,7 @@ async def _run_search(args: argparse.Namespace) -> dict[str, Any]:
             "source_url": page.url,
         }
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _selected_conversation(page, nickname: str) -> dict[str, Any]:
@@ -740,8 +767,7 @@ async def _run_find_user(args: argparse.Namespace) -> dict[str, Any]:
             "conversations": conversations,
         }
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _run_send_message(args: argparse.Namespace) -> dict[str, Any]:
@@ -801,14 +827,15 @@ async def _run_send_message(args: argparse.Namespace) -> dict[str, Any]:
             "target": selected,
         }
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 def _capabilities() -> dict[str, Any]:
     return {
         "success": True,
         "schema_version": SCHEMA_VERSION,
+        "interactive": ["login", "verify"],
+        "verification": {"detect_network_response": True, "show_manual_window": True, "resume_business_actions": False},
         "read": [
             "status",
             "search",
@@ -842,8 +869,7 @@ async def _run_item(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return {"success": True, "item": detail}
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _run_my_items(args: argparse.Namespace) -> dict[str, Any]:
@@ -885,8 +911,7 @@ async def _run_my_items(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return {"success": True, "count": len(rows), "items": rows}
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _extract_inbox_rows(page, limit: int) -> list[dict[str, Any]]:
@@ -953,8 +978,7 @@ async def _run_inbox(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return {"success": True, "count": len(rows), "conversations": rows}
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _run_read_messages(args: argparse.Namespace) -> dict[str, Any]:
@@ -1008,8 +1032,7 @@ async def _run_read_messages(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return {"success": True, "target": target, "count": len(messages), "messages": messages}
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _run_orders(args: argparse.Namespace) -> dict[str, Any]:
@@ -1059,8 +1082,7 @@ async def _run_orders(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return {"success": True, "count": len(orders), "orders": orders}
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 def _require_idempotency_key(value: str | None) -> str:
@@ -1188,8 +1210,7 @@ async def _run_publish(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return result
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _run_edit_item(args: argparse.Namespace) -> dict[str, Any]:
@@ -1251,8 +1272,7 @@ async def _run_edit_item(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return result
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 async def _run_manage_item(args: argparse.Namespace) -> dict[str, Any]:
@@ -1309,8 +1329,7 @@ async def _run_manage_item(args: argparse.Namespace) -> dict[str, Any]:
         await _save_storage_state(context, profile_dir)
         return result
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 def _favorite_state(data: dict[str, Any]) -> bool | None:
@@ -1398,6 +1417,7 @@ async def _run_favorite(args: argparse.Namespace) -> dict[str, Any]:
         raise XianyuError("invalid_idempotency_key", "真实收藏操作必须提供 1-64 位字母、数字、下划线或连字符幂等键")
     profile_dir = Path(args.profile_dir).resolve()
     manager, context = await _open_context(profile_dir, args.channel, args.headless, background=not args.headless)
+    submitted = False
     try:
         # The exclusive persistent-profile lock also serializes receipt updates.
         records = _favorite_records(profile_dir) if args.confirm_action else {}
@@ -1427,6 +1447,7 @@ async def _run_favorite(args: argparse.Namespace) -> dict[str, Any]:
         try:
             # These are the explicit add/remove APIs observed in the official
             # item page, not a toggle whose repeated use reverses the state.
+            submitted = True
             await _mtop_request(page, FAVORITE_APIS[action], {"itemId": item_id}, require_login=True)
             for attempt in range(3):
                 verified = await _favorite_detail(page, item_id)
@@ -1437,14 +1458,24 @@ async def _run_favorite(args: argparse.Namespace) -> dict[str, Any]:
                     await page.wait_for_timeout(500)
             else:
                 result = _favorite_result(item_id, action, "unknown")
+        except XianyuError as exc:
+            result = _favorite_result(item_id, action, "unknown")
+            if exc.code == "human_verification_required":
+                records[key]["result"] = result
+                _save_favorite_records(profile_dir, records)
+                raise
         except Exception:
             result = _favorite_result(item_id, action, "unknown")
         records[key]["result"] = result
         _save_favorite_records(profile_dir, records)
         return result
+    except XianyuError as exc:
+        if exc.code == "human_verification_required":
+            exc.details.update({"submitted": submitted, "item_id": item_id,
+                                "outcome": "unknown" if submitted else "not_submitted"})
+        raise
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
 
 
 def _normalize_favorites(rows: list[Any]) -> list[dict[str, Any]]:
@@ -1502,8 +1533,267 @@ async def _run_favorites(args: argparse.Namespace) -> dict[str, Any]:
                 raise XianyuError("favorites_pagination_stalled", "收藏分页没有新商品，已停止继续翻页")
         return {"success": True, "count": len(items), "total": total, "has_more": more, "items": items}
     finally:
-        await context.close()
-        await manager.stop()
+        await _close_context(manager, context)
+
+
+def _verification_codes(response: Any) -> list[str]:
+    values = response.get("ret") if isinstance(response, dict) else None
+    if not isinstance(values, list):
+        return []
+    codes = {value.split("::", 1)[0] for value in values if isinstance(value, str)}
+    return sorted(codes & VERIFICATION_CODES)
+
+
+def _verification_error(codes: list[str]) -> XianyuError:
+    return XianyuError(
+        "human_verification_required", "闲鱼要求人工验证，本次操作已停止；请在专用浏览器中手动完成验证",
+        details={"requires_user_action": True, "reason_codes": codes, "automatic_retry": False},
+    )
+
+
+def _page_verification(page):
+    return getattr(getattr(page, "context", None), "_xianyu_verification", None)
+
+
+def _official_verification_url(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) > 16384:
+        return None
+    try:
+        parsed = urlparse(value)
+        if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443)
+                or not parsed.hostname or not (parsed.hostname == "goofish.com" or parsed.hostname.endswith(".goofish.com"))):
+            return None
+        if not any(part in parsed.path.lower() for part in ("_____tmd_____", "/punish", "/captcha")):
+            return None
+        return value
+    except ValueError:
+        return None
+
+
+def _manual_read_url(raw: str) -> str:
+    try:
+        parsed = urlparse(raw)
+        item_id = parse_qs(parsed.query).get("id", [""])[0]
+        if (parsed.scheme == "https" and parsed.hostname in {"www.goofish.com", "goofish.com"}
+                and not parsed.username and not parsed.password and parsed.port in (None, 443)
+                and parsed.path == "/item" and re.fullmatch(r"\d{6,20}", item_id)):
+            return f"https://www.goofish.com/item?id={item_id}"
+    except (ValueError, TypeError):
+        pass
+    return HOME_URL
+
+
+class _VerificationMonitor:
+    """Remember the first validation response instead of losing it to SDK timeout."""
+
+    def __init__(self, context, *, headless: bool, timeout: int):
+        self.context = context
+        self.headless = headless
+        self.timeout = timeout
+        self.profile_dir = None
+        self.records = {}
+        self.successes = {}
+        self.errors = []
+        self.handoff_result = None
+        context.on("response", self.observe)
+
+    def note(self, page, codes, challenge_url=None, api=None):
+        record = self.records.setdefault(page, {"codes": set(), "apis": set(), "event": asyncio.Event(),
+                                                "completed": False, "challenge_url": None})
+        record["codes"].update(codes)
+        record["completed"] = False
+        if api:
+            record["apis"].add(api)
+        if challenge_url and record["challenge_url"] is None:
+            record["challenge_url"] = _official_verification_url(challenge_url)
+        record["event"].set()
+
+    async def observe(self, response):
+        try:
+            url = urlparse(response.url)
+            if (url.scheme != "https" or not url.hostname or not url.hostname.endswith(".goofish.com")
+                    or not url.path.lower().startswith("/h5/")):
+                return
+            api = url.path.split("/")[2].lower()
+            size = response.headers.get("content-length")
+            if size is not None and int(size) > 2 * 1024 * 1024:
+                return
+            body = await response.body()
+            if len(body) > 2 * 1024 * 1024:
+                return
+            data = json.loads(body)
+            page = response.frame.page
+            codes = _verification_codes(data)
+            if codes:
+                payload = data.get("data")
+                challenge = payload.get("url") if isinstance(payload, dict) else None
+                self.note(page, codes, challenge, api)
+            elif isinstance(data, dict) and any(isinstance(ret, str) and ret.split("::", 1)[0] == "SUCCESS" for ret in data.get("ret", [])):
+                self.successes.setdefault(page, set()).add(api)
+                record = self.records.get(page)
+                if record and (api in record["apis"] or api in record.get("proof_apis", set())):
+                    record["completed"] = True
+        except Exception:
+            # Parsing an unrelated/closed response must not leak its URL or body.
+            return
+
+    def check(self, page):
+        record = self.records.get(page)
+        if record and record["codes"]:
+            error = _verification_error(sorted(record["codes"]))
+            self.errors.append(error)
+            raise error
+
+    async def request(self, page, operation):
+        record = self.records.setdefault(page, {"codes": set(), "apis": set(), "event": asyncio.Event(),
+                                                "completed": False, "challenge_url": None})
+        # A response event may arrive while the SDK is still waiting for its
+        # own validation dialog. Cancel our wait, never resend the operation.
+        task = asyncio.ensure_future(operation)
+        watcher = asyncio.create_task(record["event"].wait())
+        try:
+            self.check(page)
+            done, _ = await asyncio.wait({task, watcher}, timeout=25, return_when=asyncio.FIRST_COMPLETED)
+            if record["codes"]:
+                self.check(page)
+            if task not in done:
+                raise XianyuError("mtop_timeout", "闲鱼页面接口超时；未捕获到明确验证原因，本次不自动重试")
+            return await task
+        finally:
+            for pending in (task, watcher):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(task, watcher, return_exceptions=True)
+
+    async def show(self, page):
+        if self.headless:
+            return False
+        session = None
+        try:
+            session = await self.context.new_cdp_session(page)
+            info = await session.send("Browser.getWindowForTarget")
+            window_id = info["windowId"]
+            await session.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "normal"}})
+            await session.send("Browser.setWindowBounds", {"windowId": window_id,
+                               "bounds": {"left": 80, "top": 80, "width": 1280, "height": 900}})
+            await page.bring_to_front()
+            return True
+        except Exception:
+            return False
+        finally:
+            if session is not None:
+                try:
+                    await session.detach()
+                except Exception:
+                    pass
+
+    async def handoff(self, page):
+        if self.handoff_result is not None:
+            return self.handoff_result
+        result = {"browser_shown": False, "state": "unconfirmed", "cookies_saved": False,
+                  "wait_seconds": self.timeout, "business_actions_resumed": False,
+                  "original_document_discarded": False}
+        self.handoff_result = result
+        if self.headless:
+            result["state"] = "headless_requires_verify"
+        elif page.is_closed():
+            result["state"] = "browser_closed"
+        elif self.timeout == 0:
+            result["state"] = "waiting_disabled"
+        else:
+            record = self.records.get(page)
+            read_url = _manual_read_url(page.url)
+            was_write = record and bool(record["apis"] & set(FAVORITE_APIS.values()))
+            # Never open a challenge that carries an original write intent.
+            # A fresh read-only item page can establish access afterward.
+            challenge = record.get("challenge_url") if record and not was_write else None
+            if was_write and read_url != HOME_URL:
+                record["proof_apis"] = {"mtop.taobao.idle.pc.detail"}
+            try:
+                # Cancelling Python's evaluate wait does NOT cancel JavaScript.
+                # Destroy the old SDK document before the user can validate it,
+                # so its pending write promise cannot resume in the browser.
+                await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+                result["original_document_discarded"] = True
+            except Exception:
+                result["state"] = "navigation_failed"
+            if result["original_document_discarded"]:
+                result["browser_shown"] = await self.show(page)
+            if result["state"] == "navigation_failed":
+                pass
+            elif not result["browser_shown"]:
+                result["state"] = "show_failed"
+            else:
+                try:
+                    await page.goto(challenge or read_url, wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                print(f"[xianyu-safe] 专用浏览器已显示，请检查并手动处理官网验证；最多等待 {self.timeout} 秒。本次不继续或重发业务操作。", file=sys.stderr)
+                deadline = time.monotonic() + self.timeout
+                while time.monotonic() < deadline:
+                    if page.is_closed():
+                        result["state"] = "browser_closed"
+                        break
+                    record = self.records.get(page)
+                    if record and record["completed"]:
+                        result["state"] = "completed"
+                        break
+                    # The explicit verify command can also establish that the
+                    # item API is accessible without a challenge in this run.
+                    if not record and "mtop.taobao.idle.pc.detail" in self.successes.get(page, set()):
+                        result["state"] = "not_required"
+                        break
+                    await asyncio.sleep(0.25)
+                else:
+                    result["state"] = "timed_out"
+                if result["state"] in {"completed", "not_required"} and self.profile_dir is not None:
+                    try:
+                        await _save_storage_state(self.context, self.profile_dir)
+                        result["cookies_saved"] = True
+                    except Exception:
+                        pass
+        for error in self.errors:
+            error.details["verification"] = dict(result)
+            if result["state"] in {"completed", "not_required"}:
+                error.message = "已检测到官网验证后的成功响应，本次操作仍已停止；请重新发起只读查询或预览，勿重发未知写操作"
+            elif result["state"] == "headless_requires_verify":
+                error.message = "闲鱼要求人工验证，当前无界面模式无法显示窗口；请运行 verify --item-id 商品ID 手动处理"
+            elif result["state"] == "waiting_disabled":
+                error.message = "闲鱼要求人工验证，本次配置为只报告；请运行 verify --item-id 商品ID 显示专用浏览器"
+            elif result["state"] in {"navigation_failed", "show_failed"}:
+                error.message = "闲鱼要求人工验证，自动显示验证页失败；请运行 verify --item-id 商品ID 手动打开"
+        return result
+
+
+async def _close_context(manager, context):
+    try:
+        monitor = getattr(context, "_xianyu_verification", None)
+        if monitor is not None and monitor.errors and monitor.handoff_result is None:
+            page = next((page for page, record in monitor.records.items() if record["codes"]), None)
+            if page is not None:
+                await monitor.handoff(page)
+    finally:
+        try:
+            await context.close()
+        finally:
+            await manager.stop()
+
+
+async def _run_verify(args: argparse.Namespace) -> dict[str, Any]:
+    item_id = _validate_item_id(args.item_id)
+    profile_dir = Path(args.profile_dir).resolve()
+    manager, context = await _open_context(profile_dir, args.channel, False, background=False, verification_timeout=args.timeout)
+    try:
+        page = await _active_page(context)
+        await _navigate(page, f"https://www.goofish.com/item?id={item_id}")
+        monitor = context._xianyu_verification
+        result = await monitor.handoff(page)
+        return {"success": result["state"] in {"completed", "not_required"},
+                "error": None if result["state"] in {"completed", "not_required"} else "verification_unconfirmed",
+                "verification": result, "submitted": False, "item_id": item_id,
+                "message": "仅检查官网访问和等待人工验证，未执行收藏或其他业务写操作"}
+    finally:
+        await _close_context(manager, context)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1520,6 +1810,8 @@ def _parser() -> argparse.ArgumentParser:
         help="Playwright 浏览器通道",
     )
     parser.add_argument("--headless", action="store_true", help="无界面运行；遇到验证时请关闭此选项")
+    parser.add_argument("--verification-timeout", type=int, default=180, choices=range(0, 601), metavar="0-600",
+                        help="检测到人工验证后显示窗口并等待的秒数；0 只报告、不等待")
 
     commands = parser.add_subparsers(dest="command", required=True)
     login = commands.add_parser("login", help="打开官方闲鱼页面并等待扫码登录")
@@ -1527,6 +1819,9 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("capabilities", help="输出当前能力、限制和安全约束")
     commands.add_parser("status", help="检查当前独立浏览器登录状态")
+    verify = commands.add_parser("verify", help="显示专用浏览器，手动处理指定商品页的官网验证；不收藏")
+    verify.add_argument("--item-id", required=True, help="被验证拦截的商品 ID")
+    verify.add_argument("--timeout", type=int, default=180, choices=range(1, 601), metavar="1-600")
 
     search = commands.add_parser("search", help="按关键词搜索商品")
     search.add_argument("--keyword", required=True, help="搜索关键词")
@@ -1618,6 +1913,8 @@ async def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return _capabilities()
     if args.command == "status":
         return await _run_status(args)
+    if args.command == "verify":
+        return await _run_verify(args)
     if args.command == "search":
         return await _run_search(args)
     if args.command == "item":
@@ -1648,8 +1945,10 @@ async def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
+    global VERIFICATION_WAIT_SECONDS
     _configure_stdio()
     args = _parser().parse_args()
+    VERIFICATION_WAIT_SECONDS = args.verification_timeout
     try:
         result = asyncio.run(_dispatch(args))
     except XianyuError as exc:
@@ -1661,7 +1960,7 @@ def main() -> None:
     except KeyboardInterrupt:
         _emit({"success": False, "error": "cancelled", "message": "操作已取消"})
         raise SystemExit(130) from None
-    if result.get("success") is False and args.command in FAVORITE_APIS:
+    if result.get("success") is False and (args.command in FAVORITE_APIS or args.command == "verify"):
         _emit(result)
         raise SystemExit(2)
     _emit(result)

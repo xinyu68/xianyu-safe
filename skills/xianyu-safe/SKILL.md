@@ -32,6 +32,7 @@ Run commands with the isolated runtime Python:
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py login
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py capabilities
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py status
+<runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py verify --item-id 1234567890 --timeout 180
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py search --keyword "iPhone 15" --province 北京 --city 北京 --min-price 3000 --max-price 5000 --limit 20
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py item --item-id 1234567890
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py favorites --limit 20
@@ -53,10 +54,10 @@ Run commands with the isolated runtime Python:
 - For login requests, run `login`. Tell the user that a dedicated Chrome window
   will open, then wait for them to scan the official QR code and confirm on the
   phone. Report only the returned nickname and status.
-- All non-login commands start a normal Chrome renderer minimized and outside the
-  visible desktop by default. This preserves headed-browser compatibility without
-  taking focus. Use `--headless` only as an explicit fallback because Xianyu may
-  reject true headless browsing.
+- Non-login queries and writes start Chrome minimized and outside the visible
+  desktop. `verify` is visible, and a detected human-verification requirement
+  restores the dedicated window for manual handling. Use `--headless` only as
+  an explicit fallback because Xianyu may reject true headless browsing.
 - For read requests, ensure `status` reports `logged_in: true`. Use `search`
   filters instead of filtering an unrelated page locally. Summarize structured
   JSON rather than dumping raw page text.
@@ -85,6 +86,28 @@ Run commands with the isolated runtime Python:
   [write safety](references/safety.md).
 - Treat login challenges, captchas, device confirmation, and risk-control pages
   as user actions. Never bypass them or ask the user to paste cookies.
+- `human_verification_required` preserves the original `FAIL_SYS_USER_VALIDATE`
+  / `RGV587_ERROR` response instead of reporting only the SDK's later timeout.
+  The CLI shows the dedicated Chrome and waits up to 180 seconds by default.
+  If stderr says the verification window is open while the command is still
+  running, promptly tell the user to handle it and keep that process alive;
+  don't start another browser using the same profile. The global option
+  `--verification-timeout 0` (before the command) disables showing/waiting.
+  Headless runs report that a visible `verify --item-id ID` is needed.
+- Manual handling never resumes or resends the interrupted business action.
+  The old SDK document is discarded first so its pending JavaScript cannot
+  resume a write. A success response for the blocked read API (or a fresh item
+  detail read after a blocked favorite write) confirms access and saves
+  the session. Closing a dialog alone is not proof. The window closes after
+  completion, user close, or the deadline; `verification.state` distinguishes
+  these outcomes. `verify` can reopen the exact item page without favoriting.
+  After completion, re-run a read or preview. If a favorite error says
+  `submitted:true` / `outcome:unknown`, preserve its receipt and inspect the
+  item; do not resend it. `submitted:false` means no collection request was
+  dispatched by that attempt.
+- `mtop_timeout` without a captured validation response has an undetermined
+  cause. Do not call it an outage, promise that waiting will fix it, or claim
+  human verification is certain. Report the diagnostic and stop repeated calls.
 - Stop after repeated page failures and report the diagnostic message. Do not
   broaden a failed operation into purchasing, payment, bulk outreach, or another
   account change.

@@ -43,3 +43,14 @@ Apply these rules before operations that can change a Xianyu account.
 Login challenges, captchas, device confirmation, and risk-control pages are
 human actions. Keep the browser visible only when the user needs to complete one
 of them. Do not request raw cookies or attempt to bypass these controls.
+
+The CLI captures the original validation response, restores the off-screen
+window, and waits for manual action with a deadline. `verify --item-id ID`
+provides a visible, read-only way to reopen the affected page. Neither path
+reissues the interrupted operation. Before showing the window, discard the old
+SDK document: cancelling the Python wait alone does not cancel browser-side
+JavaScript. A blocked write's challenge URL is not followed; open a fresh
+read-only item page instead. Confirm access only from a success response for
+the blocked read API, or item-detail read after a blocked write. Timeouts and
+closing a dialog are not confirmation. If a write may already have been sent,
+retain its unknown receipt even when manual validation succeeds.
