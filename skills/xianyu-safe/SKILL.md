@@ -1,6 +1,6 @@
 ---
 name: xianyu-safe
-description: "Safely operate Xianyu through an isolated local Chrome profile: visible QR login, filtered product search and detail lookup, own listings, inbox and message history, order lookup, explicitly approved one-off messaging, and approval-gated listing publish/edit/state management. Use for 闲鱼登录、搜索、商品详情、消息、订单或商品管理；do not use for purchasing, payment, captcha bypass, bulk outreach, or unattended interaction."
+description: "Safely operate Xianyu through an isolated local Chrome profile: QR login, product search/details, favorites, own listings, messages, orders, and approved account writes. Use for 闲鱼登录、搜索、商品详情、收藏/取消收藏/收藏列表、消息、订单或商品管理；do not use for purchasing, payment, captcha bypass, bulk outreach, or unattended interaction."
 ---
 
 # Xianyu Safe
@@ -34,6 +34,9 @@ Run commands with the isolated runtime Python:
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py status
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py search --keyword "iPhone 15" --province 北京 --city 北京 --min-price 3000 --max-price 5000 --limit 20
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py item --item-id 1234567890
+<runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py favorites --limit 20
+<runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py favorite --item-id 1234567890
+<runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py unfavorite --item-id 1234567890
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py my-items --limit 20
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py inbox --limit 20
 <runtime-python> <SKILL_DIR>/scripts/xianyu_cli.py read-messages --nickname "卖家昵称" --limit 50
@@ -62,6 +65,18 @@ Run commands with the isolated runtime Python:
   `--confirm-send` for a dry-run preview. Add `--confirm-send` only after the user
   explicitly authorizes the exact recipient and exact message. Never retry a
   send whose receipt is uncertain.
+- `favorites` reads only the current account's collection, not recommendations.
+  `item` includes `is_favorited` (null means unknown, never infer it from the
+  collection count). `favorite` and `unfavorite` preview by default. An explicit
+  user request for a specific item authorizes the matching operation; inspect
+  its preview, then use `--confirm-action --idempotency-key <unique-key>`.
+  Do not ask again when that item and action are already authorized. Already
+  matching states are no-ops. Writes use explicit add/remove page APIs and
+  verify via item detail. Reusing a key returns the original receipt without
+  submitting again; it is not a current-state query. For unknown/reserved
+  receipts, read `item` and report uncertainty; do not automatically retry with
+  a new key. Adding this capability does not authorize favoriting arbitrary
+  products as a live test.
 - `publish`, `edit-item`, and `manage-item` are dry-run by default. For a real
   write, show the preview, obtain explicit approval, then add the matching
   `--confirm-*` flag and a unique `--idempotency-key`. For deletion, also pass
@@ -77,7 +92,8 @@ Run commands with the isolated runtime Python:
 ## Current boundary
 
 This version supports login status, interactive QR-code login, server-filtered
-search, item details, own-listing lookup, inbox and message history, order lookup,
+search, item details, favorite-list lookup, approved favorite/unfavorite,
+own-listing lookup, inbox and message history, order lookup,
 explicitly confirmed one-off messages, and approval-gated publish/edit/unlist/
 mark-sold/relist/delete operations. Purchasing, payment, automatic replies,
 automatic delivery, bulk messaging, captcha bypass, and unattended operation are

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -21,7 +22,10 @@ PUBLISH_URL = "https://www.goofish.com/publish"
 PERSONAL_URL = "https://www.goofish.com/personal"
 ORDERS_URL = "https://www.goofish.com/bought"
 DEFAULT_TIMEOUT_MS = 45_000
-SCHEMA_VERSION = "0.2.0"
+SCHEMA_VERSION = "0.3.0"
+FAVORITES_URL = "https://www.goofish.com/collection"
+FAVORITES_LIST_API = "mtop.taobao.idle.web.favor.item.list"
+FAVORITE_APIS = {"favorite": "mtop.taobao.idle.collect.item", "unfavorite": "com.taobao.idle.unfavor.item"}
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
 BACKGROUND_BROWSER_ARGS = (
     "--start-minimized",
@@ -283,7 +287,7 @@ async def _navigate(page, url: str) -> None:
         raise XianyuError("navigation_failed", f"打开闲鱼页面失败：{exc}") from exc
 
 
-async def _mtop_request(page, api: str, data: dict[str, Any]) -> dict[str, Any]:
+async def _mtop_request(page, api: str, data: dict[str, Any], *, require_login: bool = False) -> dict[str, Any]:
     try:
         await page.wait_for_function(
             "() => Boolean(window.lib && window.lib.mtop && window.lib.mtop.request)",
@@ -301,7 +305,7 @@ async def _mtop_request(page, api: str, data: dict[str, Any]) -> dict[str, Any]:
                   v: '1.0',
                   dataType: 'json',
                   needLogin: false,
-                  needLoginPC: false,
+                  needLoginPC: payload.requireLogin === true,
                   sessionOption: 'AutoLoginOnly',
                   ecode: 0
                 });
@@ -315,7 +319,7 @@ async def _mtop_request(page, api: str, data: dict[str, Any]) -> dict[str, Any]:
               }
             }
             """,
-            {"api": api, "data": data},
+            {"api": api, "data": data, "requireLogin": require_login},
         )
     except Exception as exc:
         raise XianyuError("mtop_unavailable", "闲鱼页面接口尚未初始化") from exc
@@ -374,6 +378,7 @@ async def _fetch_item_detail(page, item_id: str) -> dict[str, Any]:
         "original_price": str(item.get("originalPrice") or "").strip() or None,
         "want_count": item.get("wantCnt"),
         "collect_count": item.get("collectCnt"),
+        "is_favorited": _favorite_state(data),
         "browse_count": item.get("browseCnt"),
         "status": str(item.get("itemStatusStr") or "").strip() or None,
         "condition": _label_value(labels, "成色"),
@@ -813,12 +818,13 @@ def _capabilities() -> dict[str, Any]:
             "read-messages",
             "find-user",
             "orders",
+            "favorites",
         ],
-        "write": ["send-message", "publish", "edit-item", "manage-item"],
+        "write": ["send-message", "publish", "edit-item", "manage-item", "favorite", "unfavorite"],
         "safety": {
             "write_default": "dry-run",
             "confirmation_required": True,
-            "idempotency_required": ["publish", "edit-item", "manage-item"],
+            "idempotency_required": ["publish", "edit-item", "manage-item", "favorite", "unfavorite"],
             "automatic_retry_after_submit": False,
         },
         "unsupported": ["purchase", "payment", "captcha-bypass", "bulk-outreach"],
@@ -1307,6 +1313,199 @@ async def _run_manage_item(args: argparse.Namespace) -> dict[str, Any]:
         await manager.stop()
 
 
+def _favorite_state(data: dict[str, Any]) -> bool | None:
+    buyer = data.get("buyerDO")
+    state = buyer.get("isCollected") if isinstance(buyer, dict) else None
+    return state if type(state) is bool else None
+
+
+def _favorite_records(profile_dir: Path) -> dict[str, Any]:
+    path = profile_dir / "xianyu-favorites-receipts.json"
+    if not path.exists():
+        return {}
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(records, dict) or len(records) > 1000:
+            raise ValueError()
+        for key, record in records.items():
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", key):
+                raise ValueError()
+            if not isinstance(record, dict) or set(record) != {"item_id", "action", "result"}:
+                raise ValueError()
+            _validate_item_id(record["item_id"])
+            result = record["result"]
+            if record["action"] not in FAVORITE_APIS or not isinstance(result, dict):
+                raise ValueError()
+            if (set(result) != {"success", "state", "item_id", "action", "is_favorited", "changed", "error"}
+                    or result["state"] not in {"reserved", "unknown", "verified", "already_satisfied"}
+                    or type(result["success"]) is not bool or type(result["changed"]) is not bool
+                    or result["item_id"] != record["item_id"] or result["action"] != record["action"]
+                    or result["is_favorited"] is not None and type(result["is_favorited"]) is not bool
+                    or result["error"] not in {None, "receipt_uncertain"}):
+                raise ValueError()
+        return records
+    except (OSError, ValueError, TypeError, XianyuError) as exc:
+        raise XianyuError("favorite_receipts_invalid", "收藏回执文件无法可靠读取，已停止；不会忽略记录重新提交") from exc
+
+
+def _save_favorite_records(profile_dir: Path, records: dict[str, Any]) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=profile_dir,
+                                         prefix="xianyu-favorites-", suffix=".json.tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(records, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, profile_dir / "xianyu-favorites-receipts.json")
+    except OSError as exc:
+        raise XianyuError("favorite_receipts_failed", "收藏回执保存失败，已停止；请只读核对商品状态，不要自动重试") from exc
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
+async def _favorite_login(context, page) -> None:
+    await _navigate(page, HOME_URL)
+    snapshot = await _login_snapshot(context, page)
+    if snapshot.get("logged_in") is not True:
+        raise XianyuError("not_logged_in", "尚未登录，请先运行 login 完成扫码登录")
+
+
+async def _favorite_detail(page, item_id: str) -> dict[str, Any]:
+    data = await _mtop_request(page, "mtop.taobao.idle.pc.detail", {"itemId": item_id}, require_login=True)
+    item = data.get("itemDO") or {}
+    if not isinstance(item, dict) or str(item.get("itemId")) != item_id or not str(item.get("title") or "").strip():
+        raise XianyuError("item_not_found", "无法核验目标商品，已停止")
+    state = _favorite_state(data)
+    if state is None:
+        raise XianyuError("favorite_state_unknown", "无法识别当前账号的收藏状态，已停止；收藏人数不能代替本人收藏状态")
+    return {"item_id": item_id, "title": str(item["title"]).strip(), "is_favorited": state}
+
+
+def _favorite_result(item_id: str, action: str, state: str, current: bool | None = None) -> dict[str, Any]:
+    return {"success": state in {"verified", "already_satisfied"}, "state": state, "item_id": item_id,
+            "action": action, "is_favorited": current, "changed": state == "verified",
+            "error": None if state in {"verified", "already_satisfied"} else "receipt_uncertain"}
+
+
+async def _run_favorite(args: argparse.Namespace) -> dict[str, Any]:
+    item_id = _validate_item_id(args.item_id)
+    action = args.command
+    desired = action == "favorite"
+    key = str(args.idempotency_key or "")
+    if args.confirm_action and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", key):
+        raise XianyuError("invalid_idempotency_key", "真实收藏操作必须提供 1-64 位字母、数字、下划线或连字符幂等键")
+    profile_dir = Path(args.profile_dir).resolve()
+    manager, context = await _open_context(profile_dir, args.channel, args.headless, background=not args.headless)
+    try:
+        # The exclusive persistent-profile lock also serializes receipt updates.
+        records = _favorite_records(profile_dir) if args.confirm_action else {}
+        previous = records.get(key)
+        if previous:
+            if previous["item_id"] != item_id or previous["action"] != action:
+                raise XianyuError("idempotency_conflict", "该幂等键已绑定不同商品或收藏操作")
+            return {**previous["result"], "replayed": True, "message": "返回原操作回执，未再次提交；不代表当前实时收藏状态"}
+        if args.confirm_action and len(records) >= 1000:
+            raise XianyuError("favorite_receipts_full", "收藏回执已达上限，未删除旧记录，拒绝新的写操作")
+        page = await _active_page(context)
+        await _favorite_login(context, page)
+        await _navigate(page, f"https://www.goofish.com/item?id={item_id}")
+        detail = await _favorite_detail(page, item_id)
+        current = detail["is_favorited"]
+        if not args.confirm_action:
+            return {"success": True, "dry_run": True, "action": action, **detail,
+                    "desired_state": desired, "would_change": current != desired, "submitted": False}
+        if current == desired:
+            result = _favorite_result(item_id, action, "already_satisfied", current)
+            records[key] = {"item_id": item_id, "action": action, "result": result}
+            _save_favorite_records(profile_dir, records)
+            return result
+        result = _favorite_result(item_id, action, "reserved")
+        records[key] = {"item_id": item_id, "action": action, "result": result}
+        _save_favorite_records(profile_dir, records)
+        try:
+            # These are the explicit add/remove APIs observed in the official
+            # item page, not a toggle whose repeated use reverses the state.
+            await _mtop_request(page, FAVORITE_APIS[action], {"itemId": item_id}, require_login=True)
+            for attempt in range(3):
+                verified = await _favorite_detail(page, item_id)
+                if verified["is_favorited"] == desired:
+                    result = _favorite_result(item_id, action, "verified", desired)
+                    break
+                if attempt < 2:
+                    await page.wait_for_timeout(500)
+            else:
+                result = _favorite_result(item_id, action, "unknown")
+        except Exception:
+            result = _favorite_result(item_id, action, "unknown")
+        records[key]["result"] = result
+        _save_favorite_records(profile_dir, records)
+        return result
+    finally:
+        await context.close()
+        await manager.stop()
+
+
+def _normalize_favorites(rows: list[Any]) -> list[dict[str, Any]]:
+    items = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise XianyuError("favorites_response_invalid", "收藏列表包含无法识别的商品数据")
+        item_id = _validate_item_id(row.get("id"))
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        title = row.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise XianyuError("favorites_response_invalid", "收藏商品缺少标题，不能将异常列表当作空收藏")
+        price = row.get("price")
+        status = row.get("itemStatus")
+        items.append({"id": item_id, "title": title.strip(),
+                      "price": str(price) if type(price) in {str, int, float} else None,
+                      "item_status": status if type(status) in {str, int} else None,
+                      "url": f"https://www.goofish.com/item?id={item_id}"})
+    return items
+
+
+async def _run_favorites(args: argparse.Namespace) -> dict[str, Any]:
+    profile_dir = Path(args.profile_dir).resolve()
+    manager, context = await _open_context(profile_dir, args.channel, args.headless, background=not args.headless)
+    try:
+        page = await _active_page(context)
+        await _favorite_login(context, page)
+        await _navigate(page, FAVORITES_URL)
+        items, seen = [], set()
+        total = None
+        more = False
+        for page_number in range(1, 11):
+            data = await _mtop_request(page, FAVORITES_LIST_API,
+                                       {"pageNumber": page_number, "rowsPerPage": 20, "type": "DEFAULT"}, require_login=True)
+            rows = data.get("items")
+            if not isinstance(rows, list) or type(data.get("nextPage")) is not bool:
+                raise XianyuError("favorites_response_invalid", "收藏列表格式已变化，未将异常结果当作空收藏")
+            count = data.get("totalCount")
+            if count is not None and (type(count) is not int or count < 0):
+                raise XianyuError("favorites_response_invalid", "收藏列表总数格式不受支持")
+            total = count if page_number == 1 else total
+            normalized = _normalize_favorites(rows)
+            unique = [item for item in normalized if item["id"] not in seen]
+            remaining = args.limit - len(items)
+            for item in unique[:remaining]:
+                seen.add(item["id"])
+                items.append(item)
+            more = data["nextPage"] or len(unique) > remaining
+            if len(items) >= args.limit or not data["nextPage"]:
+                break
+            if not unique:
+                raise XianyuError("favorites_pagination_stalled", "收藏分页没有新商品，已停止继续翻页")
+        return {"success": True, "count": len(items), "total": total, "has_more": more, "items": items}
+    finally:
+        await context.close()
+        await manager.stop()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="安全操作闲鱼：搜索、消息、订单与商品管理")
     parser.add_argument(
@@ -1340,6 +1539,14 @@ def _parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("item", help="读取商品详情")
     item.add_argument("--item-id", required=True, help="闲鱼商品 ID")
+
+    favorites = commands.add_parser("favorites", help="查看当前账号的收藏商品列表")
+    favorites.add_argument("--limit", type=int, default=20, choices=range(1, 101), metavar="1-100")
+    for command, label in (("favorite", "收藏"), ("unfavorite", "取消收藏")):
+        favorite = commands.add_parser(command, help=f"预览或{label}指定商品；默认仅 dry-run")
+        favorite.add_argument("--item-id", required=True, help="闲鱼商品 ID")
+        favorite.add_argument("--confirm-action", action="store_true", help=f"确认真实{label}")
+        favorite.add_argument("--idempotency-key", help="真实操作必填；同一键不重复提交")
 
     my_items = commands.add_parser("my-items", help="列出当前账号发布的商品")
     my_items.add_argument("--limit", type=int, default=50, choices=range(1, 101), metavar="1-100")
@@ -1415,6 +1622,10 @@ async def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return await _run_search(args)
     if args.command == "item":
         return await _run_item(args)
+    if args.command == "favorites":
+        return await _run_favorites(args)
+    if args.command in FAVORITE_APIS:
+        return await _run_favorite(args)
     if args.command == "my-items":
         return await _run_my_items(args)
     if args.command == "inbox":
@@ -1450,6 +1661,9 @@ def main() -> None:
     except KeyboardInterrupt:
         _emit({"success": False, "error": "cancelled", "message": "操作已取消"})
         raise SystemExit(130) from None
+    if result.get("success") is False and args.command in FAVORITE_APIS:
+        _emit(result)
+        raise SystemExit(2)
     _emit(result)
 
 

@@ -8,3 +8,4 @@
 *.json.tmp
 xianyu-storage-state.json
 xianyu-idempotency.json
+xianyu-favorites-receipts.json
